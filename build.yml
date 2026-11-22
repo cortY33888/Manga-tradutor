@@ -1,0 +1,346 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Criar arquivos do projeto
+        run: |
+          mkdir -p proj
+          cat > proj/build.gradle.kts <<'__END__'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          __END__
+          cat > proj/gradle.properties <<'__END__'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          __END__
+          cat > proj/settings.gradle.kts <<'__END__'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "MangaTradutor"
+          include(":app")
+          __END__
+          mkdir -p proj/app
+          cat > proj/app/build.gradle.kts <<'__END__'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.mangatradutor"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.mangatradutor"
+                  minSdk = 30
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("com.google.mlkit:text-recognition:16.0.1")
+              implementation("com.google.mlkit:translate:17.0.3")
+          }
+          __END__
+          mkdir -p proj/app/src/main
+          cat > proj/app/src/main/AndroidManifest.xml <<'__END__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".TranslatorService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          __END__
+          mkdir -p proj/app/src/main/java/com/example/mangatradutor
+          cat > proj/app/src/main/java/com/example/mangatradutor/MainActivity.kt <<'__END__'
+          package com.example.mangatradutor
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 96, 48, 48)
+                  }
+                  box.addView(TextView(this).apply {
+                      textSize = 16f
+                      text = "1. Toque no botão abaixo e ative o Manga Tradutor em Acessibilidade.\n\n" +
+                          "2. Abra seu mangá e toque no botão azul PT que flutua na tela.\n\n" +
+                          "3. Toque de novo (no botão ou na tela) para remover a tradução. Arraste o botão para mudar de lugar.\n\n" +
+                          "Na primeira vez é preciso internet para baixar o modelo de tradução."
+                  })
+                  box.addView(Button(this).apply {
+                      text = "Abrir Acessibilidade"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  })
+                  setContentView(box)
+              }
+          }
+          __END__
+          mkdir -p proj/app/src/main/java/com/example/mangatradutor
+          cat > proj/app/src/main/java/com/example/mangatradutor/TranslatorService.kt <<'__END__'
+          package com.example.mangatradutor
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Context
+          import android.graphics.*
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Handler
+          import android.os.Looper
+          import android.text.Layout
+          import android.text.StaticLayout
+          import android.text.TextPaint
+          import android.view.*
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.TextView
+          import android.widget.Toast
+          import com.google.mlkit.nl.translate.TranslateLanguage
+          import com.google.mlkit.nl.translate.Translation
+          import com.google.mlkit.nl.translate.TranslatorOptions
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.text.Text
+          import com.google.mlkit.vision.text.TextRecognition
+          import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+          import kotlin.math.abs
+
+          class TranslatorService : AccessibilityService() {
+
+              private class Item(val box: RectF, val layout: StaticLayout, val bg: Int, val x: Float, val y: Float)
+
+              private lateinit var wm: WindowManager
+              private lateinit var button: TextView
+              private lateinit var buttonLp: WindowManager.LayoutParams
+              private var overlay: View? = null
+              private val ui = Handler(Looper.getMainLooper())
+              private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+              private val translator = Translation.getClient(
+                  TranslatorOptions.Builder()
+                      .setSourceLanguage(TranslateLanguage.ENGLISH)
+                      .setTargetLanguage(TranslateLanguage.PORTUGUESE)
+                      .build()
+              )
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  translator.downloadModelIfNeeded()
+                  wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  val size = (56 * resources.displayMetrics.density).toInt()
+                  buttonLp = WindowManager.LayoutParams(
+                      size, size,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.TOP or Gravity.START; x = 0; y = 400 }
+                  button = TextView(this).apply {
+                      text = "PT"
+                      textSize = 16f
+                      setTextColor(Color.WHITE)
+                      gravity = Gravity.CENTER
+                      background = GradientDrawable().apply {
+                          shape = GradientDrawable.OVAL
+                          setColor(0xCC1565C0.toInt())
+                      }
+                  }
+                  var sx = 0; var sy = 0; var dx = 0f; var dy = 0f; var moved = false
+                  button.setOnTouchListener { v, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> { sx = buttonLp.x; sy = buttonLp.y; dx = e.rawX; dy = e.rawY; moved = false }
+                          MotionEvent.ACTION_MOVE -> {
+                              val mx = (e.rawX - dx).toInt()
+                              val my = (e.rawY - dy).toInt()
+                              if (abs(mx) > 10 || abs(my) > 10) moved = true
+                              buttonLp.x = sx + mx; buttonLp.y = sy + my
+                              wm.updateViewLayout(v, buttonLp)
+                          }
+                          MotionEvent.ACTION_UP -> if (!moved) onTap()
+                      }
+                      true
+                  }
+                  wm.addView(button, buttonLp)
+              }
+
+              private fun fail(msg: String = "Erro ao traduzir. Na primeira vez é preciso internet.") =
+                  Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+
+              private fun clear() {
+                  overlay?.let { wm.removeView(it) }
+                  overlay = null
+              }
+
+              private fun onTap() {
+                  if (overlay != null) { clear(); return }
+                  button.visibility = View.INVISIBLE
+                  ui.postDelayed({
+                      takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : AccessibilityService.TakeScreenshotCallback {
+                          override fun onSuccess(r: AccessibilityService.ScreenshotResult) {
+                              val bmp = Bitmap.wrapHardwareBuffer(r.hardwareBuffer, r.colorSpace)
+                                  ?.copy(Bitmap.Config.ARGB_8888, false)
+                              r.hardwareBuffer.close()
+                              button.visibility = View.VISIBLE
+                              if (bmp != null) process(bmp) else fail()
+                          }
+                          override fun onFailure(errorCode: Int) {
+                              button.visibility = View.VISIBLE
+                              fail()
+                          }
+                      })
+                  }, 200)
+              }
+
+              private fun process(bmp: Bitmap) {
+                  recognizer.process(InputImage.fromBitmap(bmp, 0))
+                      .addOnSuccessListener { res ->
+                          val blocks = res.textBlocks.filter { it.boundingBox != null && it.text.any { c -> c.isLetter() } }
+                          if (blocks.isEmpty()) { fail("Nenhum texto encontrado."); return@addOnSuccessListener }
+                          translator.downloadModelIfNeeded()
+                              .addOnSuccessListener {
+                                  val out = arrayOfNulls<String>(blocks.size)
+                                  var left = blocks.size
+                                  blocks.forEachIndexed { i, b ->
+                                      translator.translate(b.lines.joinToString(" ") { it.text })
+                                          .addOnSuccessListener { t -> out[i] = t }
+                                          .addOnCompleteListener { if (--left == 0) show(blocks, out, bmp) }
+                                  }
+                              }
+                              .addOnFailureListener { fail() }
+                      }
+                      .addOnFailureListener { fail() }
+              }
+
+              private fun show(blocks: List<Text.TextBlock>, out: Array<String?>, bmp: Bitmap) {
+                  val items = ArrayList<Item>()
+                  blocks.forEachIndexed { i, b ->
+                      val tr = out[i] ?: return@forEachIndexed
+                      val r = b.boundingBox ?: return@forEachIndexed
+                      val src = b.lines.joinToString(" ") { it.text }
+                      val caps = src == src.uppercase()
+                      // Tamanho da letra = altura média das linhas originais (mangá costuma ser em maiúsculas)
+                      val h = b.lines.map { (it.boundingBox?.height() ?: r.height()).toFloat() }.average().toFloat()
+                      val bg = bmp.getPixel((r.left - 4).coerceIn(0, bmp.width - 1), (r.top - 4).coerceIn(0, bmp.height - 1))
+                      val lum = (Color.red(bg) * 299 + Color.green(bg) * 587 + Color.blue(bg) * 114) / 1000
+                      val paint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                          textSize = h * (if (caps) 1.4f else 1.05f)
+                          typeface = Typeface.DEFAULT_BOLD
+                          color = if (lum > 128) Color.BLACK else Color.WHITE
+                      }
+                      val text = if (caps) tr.uppercase() else tr
+                      val layout = StaticLayout.Builder.obtain(text, 0, text.length, paint, r.width())
+                          .setAlignment(Layout.Alignment.ALIGN_CENTER).build()
+                      val cy = r.exactCenterY()
+                      val top = cy - layout.height / 2f
+                      val box = RectF(
+                          r.left - 6f, minOf(r.top - 6f, top - 6f),
+                          r.right + 6f, maxOf(r.bottom + 6f, top + layout.height + 6f)
+                      )
+                      items.add(Item(box, layout, bg, r.left.toFloat(), top))
+                  }
+                  if (items.isEmpty()) { fail("Nada para traduzir."); return }
+
+                  val v = object : View(this@TranslatorService) {
+                      private val p = Paint()
+                      override fun onDraw(c: Canvas) {
+                          for (m in items) {
+                              p.color = m.bg
+                              c.drawRoundRect(m.box, 8f, 8f, p)
+                              c.save(); c.translate(m.x, m.y); m.layout.draw(c); c.restore()
+                          }
+                      }
+                  }
+                  v.setOnClickListener { clear() }
+                  val lp = WindowManager.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                  wm.addView(v, lp)
+                  overlay = v
+                  // mantém o botão por cima da tradução
+                  wm.removeView(button)
+                  wm.addView(button, buttonLp)
+              }
+          }
+          __END__
+          mkdir -p proj/app/src/main/res/xml
+          cat > proj/app/src/main/res/xml/accessibility_config.xml <<'__END__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canTakeScreenshot="true"
+              android:description="@string/service_desc"
+              android:notificationTimeout="100" />
+          __END__
+          mkdir -p proj/app/src/main/res/values
+          cat > proj/app/src/main/res/values/strings.xml <<'__END__'
+          <resources>
+              <string name="app_name">Manga Tradutor</string>
+              <string name="service_desc">Mostra um botão flutuante que captura a tela e traduz o texto em inglês para português.</string>
+          </resources>
+          __END__
+          mkdir -p proj/gradle/wrapper
+          cat > proj/gradle/wrapper/gradle-wrapper.properties <<'__END__'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.7-bin.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          __END__
+      - name: Compilar
+        working-directory: proj
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MangaTradutor-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
